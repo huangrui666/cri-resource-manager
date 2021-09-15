@@ -21,6 +21,7 @@ import (
 	"strings"
 
 	corev1 "k8s.io/api/core/v1"
+	v1 "k8s.io/api/core/v1"
 	resapi "k8s.io/apimachinery/pkg/api/resource"
 	"k8s.io/kubernetes/pkg/kubelet/cm/cpuset"
 
@@ -89,6 +90,9 @@ type Pool struct {
 	//   currently assigned to the pool.
 	// - Def.MaxPods - len(PodIDs) is free pod capacity.
 	PodIDs map[string][]string
+	// CPUThreshold specifies the percentage of this pool's
+	// CPU resource can be used to assign the pods.
+	CPUThreshold float64
 }
 
 var log logger.Logger = logger.NewLogger("policy")
@@ -286,10 +290,26 @@ func (p *podpools) allocatePool(pod cache.Pod) *Pool {
 		return nil
 	}
 	// Try to find a suitable pool and allocate it for the pod.
-	pools := filterPools(p.pools,
-		func(pl *Pool) bool {
-			return poolDef.Name == pl.Def.Name && (pl.Def.MaxPods > len(pl.PodIDs) || pl.Def.MaxPods == 0)
-		})
+	var pools []*Pool
+	switch poolDef.FillOrder {
+	case FillMinCPU:
+		// FillMinCPU needs to work with cri-resmgr-webhook. cri-resmgr-webhook
+		// gives original pod spec resource requirements so that FillMinCPU can
+		// use pods' CPU requirements to choose the proper pool.
+		annotatedPodMilliCPU, err := p.getOriginPodMilliCPU(pod)
+		if err == nil {
+			pools = filterPools(p.pools,
+				func(pl *Pool) bool {
+					return poolDef.Name == pl.Def.Name && p.originAvailableMilliCPUs(pl) >= annotatedPodMilliCPU
+				})
+		}
+	default:
+		pools = filterPools(p.pools,
+			func(pl *Pool) bool {
+				return poolDef.Name == pl.Def.Name && (pl.Def.MaxPods > len(pl.PodIDs) || pl.Def.MaxPods == 0)
+			})
+	}
+
 	// Sort pools according to pool type fill order so that the
 	// first pool in the list is the preferred one.
 	switch poolDef.FillOrder {
@@ -303,11 +323,25 @@ func (p *podpools) allocatePool(pod cache.Pod) *Pool {
 		})
 	case FillFirstFree:
 		// FirstFree is already the first of the pools list.
+	case FillMinCPU:
+		sort.Slice(pools, func(i, j int) bool {
+			return p.originAvailableMilliCPUs(pools[i]) > p.originAvailableMilliCPUs(pools[j])
+		})
 	}
+
 	if len(pools) == 0 {
+		if !podpoolsOptions.Fallback {
+			log.Info("cannot find free %q pool for pod %q and not falling back", poolDef.Name, pod.GetName())
+			return nil
+		}
 		log.Error("cannot find free %q pool for pod %q, falling back to %q", poolDef.Name, pod.GetName(), defaultPoolDefName)
 		pools = []*Pool{p.pools[1]}
 	}
+
+	for _, pl := range pools {
+		log.Info(p.dumpPool(pl))
+	}
+
 	// Found a suitable pool. Allocate it for the pod.
 	podID := pod.GetID()
 	pool := pools[0]
@@ -342,8 +376,8 @@ func (p *podpools) dumpPool(pool *Pool) string {
 			}
 		}
 	}
-	s := fmt.Sprintf("Pool{Def.Name: %q, Instance: %d, CPUs: %s, Mems: %s, Def.MaxPods: %d, pods: %v, containers:%v}",
-		pool.Def.Name, pool.Instance, pool.CPUs, pool.Mems, pool.Def.MaxPods, pods, conts)
+	s := fmt.Sprintf("Pool{Def.Name: %q, Instance: %d, CPUs: %s, Mems: %s, Def.MaxPods: %d, pods: %v, containers:%v, poolCPUThreshold:%f, available:%d}",
+		pool.Def.Name, pool.Instance, pool.CPUs, pool.Mems, pool.Def.MaxPods, pods, conts, pool.CPUThreshold, p.availableMilliCPUs(pool))
 	return s
 }
 
@@ -400,6 +434,38 @@ func (p *podpools) validatePodCPU(pod cache.Pod, pool *Pool) {
 			}
 		}
 	}
+}
+
+// getOriginPodMilliCPU get original pod spec resource requirements from webhook.
+func (p *podpools) getOriginPodMilliCPU(pod cache.Pod) (int64, error) {
+	// Judge whether the pods has been annotated by webhook.
+	_, ok := pod.GetAnnotation(cache.KeyResourceAnnotation)
+	if !ok {
+		log.Error("The cri-resmgr-webhook doesn't be enabled.")
+		return 0, podpoolsError("The cri-resmgr-webhook doesn't be enabled.")
+	}
+	resourceRequirements := pod.GetPodResourceRequirements()
+	cpuRequested := int64(0)
+	for _, value := range resourceRequirements.InitContainers {
+		limit := value.Limits[v1.ResourceCPU]
+		request := value.Requests[v1.ResourceCPU]
+		if limit.MilliValue() > request.MilliValue() {
+			cpuRequested = cpuRequested + limit.MilliValue()
+		} else {
+			cpuRequested = cpuRequested + request.MilliValue()
+		}
+	}
+	for _, value := range resourceRequirements.Containers {
+		limit := value.Limits[v1.ResourceCPU]
+		request := value.Requests[v1.ResourceCPU]
+		if limit.MilliValue() > request.MilliValue() {
+			cpuRequested = cpuRequested + limit.MilliValue()
+		} else {
+			cpuRequested = cpuRequested + request.MilliValue()
+		}
+	}
+	log.Info("vicky-----pod %s ---getOriginPodMilliCPU %d", pod.GetName(), cpuRequested)
+	return cpuRequested, nil
 }
 
 // getPodMilliCPU returns mCPUs requested by podID.
@@ -488,7 +554,12 @@ func (p *podpools) applyPoolDef(pools *[]*Pool, poolDef *PoolDef, freeCpus *cpus
 				return podpoolsError("pool %q: number of CPUs is conflicting ReservedResources CPUs", poolDef.Name)
 			}
 		}
+		cpuThreshold, err := getPoolCPUThreshold(poolDef.PoolCPUThreshold)
+		if err != nil {
+			return podpoolsError("pool %q: %w", poolDef.Name, err)
+		}
 		reservedPool.Def.MaxPods = poolDef.MaxPods
+		reservedPool.CPUThreshold = cpuThreshold
 
 	case defaultPool.Def.Name:
 		// Case 2: reconfigure the "default" pool.
@@ -507,7 +578,12 @@ func (p *podpools) applyPoolDef(pools *[]*Pool, poolDef *PoolDef, freeCpus *cpus
 			}
 			defaultPool.CPUs = cpus
 		}
+		cpuThreshold, err := getPoolCPUThreshold(poolDef.PoolCPUThreshold)
+		if err != nil {
+			return podpoolsError("pool %q: %w", poolDef.Name, err)
+		}
 		defaultPool.Def.MaxPods = poolDef.MaxPods
+		defaultPool.CPUThreshold = cpuThreshold
 
 	default:
 		// Case 3: create new user-defined pool(s).
@@ -521,6 +597,10 @@ func (p *podpools) applyPoolDef(pools *[]*Pool, poolDef *PoolDef, freeCpus *cpus
 		if poolCount > 1 && poolDef.FillOrder == FillPacked && poolDef.MaxPods == 0 {
 			return podpoolsError("pool %q: %d pool(s) unreachable due to unlimited pod capacity and FillOrder: %s", poolDef.Name, poolCount-1, poolDef.FillOrder)
 		}
+		cpuThreshold, err := getPoolCPUThreshold(poolDef.PoolCPUThreshold)
+		if err != nil {
+			return podpoolsError("pool %q: %w", poolDef.Name, err)
+		}
 		log.Debug("allocating %d out of %d non-reserved CPUs for %d %q pools", poolCount*cpusPerPool, nonReservedCpuCount, poolCount, poolDef.Name)
 		for poolIndex := 0; poolIndex < poolCount; poolIndex++ {
 			if cpusPerPool > freeCpus.Size() {
@@ -531,9 +611,10 @@ func (p *podpools) applyPoolDef(pools *[]*Pool, poolDef *PoolDef, freeCpus *cpus
 				return podpoolsError("could not allocate %d CPUs for instance %d of pool %q: %w", cpusPerPool, poolIndex, poolDef.Name, err)
 			}
 			pool := Pool{
-				Def:      poolDef,
-				Instance: poolIndex,
-				CPUs:     cpus,
+				Def:          poolDef,
+				Instance:     poolIndex,
+				CPUs:         cpus,
+				CPUThreshold: cpuThreshold,
 			}
 			*pools = append(*pools, &pool)
 		}
@@ -547,8 +628,9 @@ func (p *podpools) setConfig(ppoptions *PodpoolsOptions) error {
 	pools := []*Pool{}
 	// Built-in reserved pool.
 	reservedPool := Pool{
-		Def:  p.reservedPoolDef,
-		CPUs: p.reserved,
+		Def:          p.reservedPoolDef,
+		CPUs:         p.reserved,
+		CPUThreshold: 1.0,
 	}
 	pools = append(pools, &reservedPool)
 	// Built-in default pool.
@@ -556,8 +638,9 @@ func (p *podpools) setConfig(ppoptions *PodpoolsOptions) error {
 	// are left over after constructing user-defined pools, those
 	// will be used as the Default pool instead.
 	defaultPool := Pool{
-		Def:  p.defaultPoolDef,
-		CPUs: reservedPool.CPUs,
+		Def:          p.defaultPoolDef,
+		CPUs:         reservedPool.CPUs,
+		CPUThreshold: 1.0,
 	}
 	pools = append(pools, &defaultPool)
 	// Apply pool definitions from configuration.
@@ -566,6 +649,9 @@ func (p *podpools) setConfig(ppoptions *PodpoolsOptions) error {
 	nonReservedCpuCount := freeCpus.Size()
 	userPoolDefs := 0
 	for _, poolDef := range ppoptions.PoolDefs {
+		if poolDef.FillOrder == FillMinCPU && poolDef.MaxPods != 0 {
+			return podpoolsError("Bad configuration, MaxPods must not be defined when using MinCPU fill order.")
+		}
 		if err := p.applyPoolDef(&pools, poolDef, &freeCpus, nonReservedCpuCount); err != nil {
 			return err
 		}
@@ -589,7 +675,7 @@ func (p *podpools) setConfig(ppoptions *PodpoolsOptions) error {
 	for index, pool := range pools {
 		pool.Mems = p.closestMems(pool.CPUs)
 		pool.PodIDs = make(map[string][]string)
-		log.Info("- pool %d: %s", index, pool)
+		log.Info("- pool %d: %s, poolCPUThreshold %f, availableMilliCPUs %d", index, pool, pool.CPUThreshold, p.availableMilliCPUs(pool))
 	}
 	// No errors in pool creation, take new configuration into use.
 	log.Debug("new %s configuration:\n%s", PolicyName, utils.DumpJSON(ppoptions))
@@ -623,6 +709,20 @@ func filterPools(pools []*Pool, test func(*Pool) bool) (ret []*Pool) {
 		}
 	}
 	return
+}
+
+func getPoolCPUThreshold(threshold string) (float64, error) {
+	if threshold == "" {
+		return 1.0, nil
+	}
+	floatThreshold, err := strconv.ParseFloat(threshold, 64)
+	if err != nil {
+		return 0.0, podpoolsError("Wrong configuration of PoolCPUThreshold")
+	}
+	if floatThreshold > 1.0 || floatThreshold <= 0.0 {
+		return 0.0, podpoolsError("Wrong configuration. PoolCPUThreshold should be (0.0 < PoolCPUThreshold <= 1.0)")
+	}
+	return floatThreshold, nil
 }
 
 // parseInstancesCPUs parses the number of pool instances and the
@@ -686,12 +786,31 @@ func parseInstancesCPUs(is string, cs string, freeCpus int) (int, int, error) {
 
 // availableMilliCPU returns mCPUs available in a pool.
 func (p *podpools) availableMilliCPUs(pool *Pool) int64 {
-	cpuAvail := int64(pool.CPUs.Size() * 1000)
+	cpuAvail := float64(pool.CPUs.Size()*1000) * pool.CPUThreshold
 	cpuRequested := int64(0)
 	for podID := range pool.PodIDs {
 		cpuRequested += p.getPodMilliCPU(podID)
 	}
-	return cpuAvail - cpuRequested
+	// log.Info("vicky-pool %s cpuAvail float %f, cpuAvail int64 %d, cpuRequested %d", pool.PrettyName(), cpuAvail, int64(cpuAvail), cpuRequested)
+	return int64(cpuAvail) - cpuRequested
+}
+
+// originAvailableMilliCPUs calculates mCPUs available in a pool by using the original resource
+// requirments of pods from cri-resmgr-webhook.
+func (p *podpools) originAvailableMilliCPUs(pool *Pool) int64 {
+	cpuAvail := float64(pool.CPUs.Size()*1000) * pool.CPUThreshold
+	cpuRequested := int64(0)
+	for podID := range pool.PodIDs {
+		pod, isFind := p.cch.LookupPod(podID)
+		if isFind {
+			originPodMilliCPU, err := p.getOriginPodMilliCPU(pod)
+			if err == nil {
+				cpuRequested += originPodMilliCPU
+			}
+		}
+	}
+	log.Info("vicky-pool %s cpuAvail float %f, cpuAvail int64 %d, cpuRequested %d", pool.PrettyName(), cpuAvail, int64(cpuAvail), cpuRequested)
+	return int64(cpuAvail) - cpuRequested
 }
 
 // assignContainer adds a container to a pool
