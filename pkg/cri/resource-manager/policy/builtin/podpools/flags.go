@@ -30,6 +30,9 @@ type PodpoolsOptions struct {
 	PinMemory bool `json:"PinMemory,omitempty"`
 	// PoolDefs contains pool definitions
 	PoolDefs []*PoolDef `json:"Pools,omitempty"`
+	// Fallback controls whether to fallback to reserved or defualt pools
+	// when there is no free user-defined pool to assign pods.
+	Fallback bool `json:"Fallback,omitempty"`
 }
 
 // PoolDef contains a pool definition.
@@ -50,6 +53,10 @@ type PoolDef struct {
 	Instances string `json:"Instances,omitempty"`
 	// FillOrder specifies how multi-instance pools are filled.
 	FillOrder FillOrder `json:"FillOrder"`
+	// PoolCPUThreshold specifies the percentage of this pool's
+	// CPU resource can be used to assign the pods.
+	// 0.0 < PoolCPUThreshold <= 1.0. And the default is 1.0.
+	PoolCPUThreshold string `json:"PoolCPUThreshold,omitempty"`
 	// For the future: when enabling dynamic (on-demand) pool
 	// instantiation, consider different ways of handling the case
 	// of MaxPods>1, FillOrder==Balanced. Creating underloaded
@@ -66,12 +73,15 @@ const (
 	FillBalanced FillOrder = iota
 	FillPacked
 	FillFirstFree
+	// FillMinCPU chooses the pool whose CPU usage is minimal.
+	FillMinCPU
 )
 
 var fillOrderNames = map[FillOrder]string{
 	FillBalanced:  "Balanced",
 	FillPacked:    "Packed",
 	FillFirstFree: "FirstFree",
+	FillMinCPU:    "MinCPU",
 }
 
 // String stringifies a FillOrder
@@ -109,6 +119,7 @@ func defaultPodpoolsOptions() interface{} {
 	return &PodpoolsOptions{
 		PinCPU:    true,
 		PinMemory: true,
+		Fallback:  true,
 	}
 }
 
