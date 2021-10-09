@@ -50,6 +50,10 @@ type PoolDef struct {
 	Instances string `json:"Instances,omitempty"`
 	// FillOrder specifies how multi-instance pools are filled.
 	FillOrder FillOrder `json:"FillOrder"`
+	// PoolCPUThreshold specifies the percentage of this pool's
+	// CPU resource used to assign the pods.
+	// 0.0 < PoolCPUThreshold <= 1.0. The default is 1.0.
+	PoolCPUThreshold string `json:"PoolCPUThreshold,omitempty"`
 	// For the future: when enabling dynamic (on-demand) pool
 	// instantiation, consider different ways of handling the case
 	// of MaxPods>1, FillOrder==Balanced. Creating underloaded
