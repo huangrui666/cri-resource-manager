@@ -30,6 +30,10 @@ type PodpoolsOptions struct {
 	PinMemory bool `json:"PinMemory,omitempty"`
 	// PoolDefs contains pool definitions
 	PoolDefs []*PoolDef `json:"Pools,omitempty"`
+	// Fallback controls whether to fallback to reserved or defualt pools
+	// when there is no free user-defined pool to assign pods.
+	// The defualt is true.
+	Fallback bool `json:"Fallback,omitempty"`
 }
 
 // PoolDef contains a pool definition.
@@ -70,12 +74,15 @@ const (
 	FillBalanced FillOrder = iota
 	FillPacked
 	FillFirstFree
+	// FillMinCPU chooses the pool whose CPU usage is minimal.
+	FillMinCPU
 )
 
 var fillOrderNames = map[FillOrder]string{
 	FillBalanced:  "Balanced",
 	FillPacked:    "Packed",
 	FillFirstFree: "FirstFree",
+	FillMinCPU:    "MinCPU",
 }
 
 // String stringifies a FillOrder
@@ -113,6 +120,7 @@ func defaultPodpoolsOptions() interface{} {
 	return &PodpoolsOptions{
 		PinCPU:    true,
 		PinMemory: true,
+		Fallback:  true,
 	}
 }
 

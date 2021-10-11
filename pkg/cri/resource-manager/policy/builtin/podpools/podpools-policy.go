@@ -21,6 +21,7 @@ import (
 	"strings"
 
 	corev1 "k8s.io/api/core/v1"
+	v1 "k8s.io/api/core/v1"
 	resapi "k8s.io/apimachinery/pkg/api/resource"
 	"k8s.io/kubernetes/pkg/kubelet/cm/cpuset"
 
@@ -289,10 +290,26 @@ func (p *podpools) allocatePool(pod cache.Pod) *Pool {
 		return nil
 	}
 	// Try to find a suitable pool and allocate it for the pod.
-	pools := filterPools(p.pools,
-		func(pl *Pool) bool {
-			return poolDef.Name == pl.Def.Name && (pl.Def.MaxPods > len(pl.PodIDs) || pl.Def.MaxPods == 0)
-		})
+	var pools []*Pool
+	switch poolDef.FillOrder {
+	case FillMinCPU:
+		// FillMinCPU needs to work with cri-resmgr-webhook. cri-resmgr-webhook
+		// gives original pod spec resource requirements so that FillMinCPU can
+		// use pods' CPU requirements to choose the proper pool.
+		annotatedPodMilliCPU, err := p.getOriginPodMilliCPU(pod)
+		if err == nil {
+			pools = filterPools(p.pools,
+				func(pl *Pool) bool {
+					return poolDef.Name == pl.Def.Name && p.originAvailableMilliCPUs(pl) >= annotatedPodMilliCPU
+				})
+		}
+	default:
+		pools = filterPools(p.pools,
+			func(pl *Pool) bool {
+				return poolDef.Name == pl.Def.Name && (pl.Def.MaxPods > len(pl.PodIDs) || pl.Def.MaxPods == 0)
+			})
+	}
+
 	// Sort pools according to pool type fill order so that the
 	// first pool in the list is the preferred one.
 	switch poolDef.FillOrder {
@@ -306,8 +323,16 @@ func (p *podpools) allocatePool(pod cache.Pod) *Pool {
 		})
 	case FillFirstFree:
 		// FirstFree is already the first of the pools list.
+	case FillMinCPU:
+		sort.Slice(pools, func(i, j int) bool {
+			return p.originAvailableMilliCPUs(pools[i]) > p.originAvailableMilliCPUs(pools[j])
+		})
 	}
 	if len(pools) == 0 {
+		if !podpoolsOptions.Fallback {
+			log.Info("cannot find free %q pool for pod %q and not falling back", poolDef.Name, pod.GetName())
+			return nil
+		}
 		log.Error("cannot find free %q pool for pod %q, falling back to %q", poolDef.Name, pod.GetName(), defaultPoolDefName)
 		pools = []*Pool{p.pools[1]}
 	}
@@ -345,8 +370,8 @@ func (p *podpools) dumpPool(pool *Pool) string {
 			}
 		}
 	}
-	s := fmt.Sprintf("Pool{Def.Name: %q, Instance: %d, CPUs: %s, Mems: %s, Def.MaxPods: %d, pods: %v, containers:%v, poolCPUThreshold:%f}",
-		pool.Def.Name, pool.Instance, pool.CPUs, pool.Mems, pool.Def.MaxPods, pods, conts, pool.CPUThreshold)
+	s := fmt.Sprintf("Pool{Def.Name: %q, Instance: %d, CPUs: %s, Mems: %s, Def.MaxPods: %d, pods: %v, containers:%v, poolCPUThreshold:%f, available:%d}",
+		pool.Def.Name, pool.Instance, pool.CPUs, pool.Mems, pool.Def.MaxPods, pods, conts, pool.CPUThreshold, p.availableMilliCPUs(pool))
 	return s
 }
 
@@ -403,6 +428,38 @@ func (p *podpools) validatePodCPU(pod cache.Pod, pool *Pool) {
 			}
 		}
 	}
+}
+
+// getOriginPodMilliCPU get original pod spec resource requirements from webhook.
+func (p *podpools) getOriginPodMilliCPU(pod cache.Pod) (int64, error) {
+	// Judge whether the pods has been annotated by webhook.
+	_, ok := pod.GetAnnotation(cache.KeyResourceAnnotation)
+	if !ok {
+		log.Error("The cri-resmgr-webhook doesn't be enabled.")
+		return 0, podpoolsError("The cri-resmgr-webhook doesn't be enabled.")
+	}
+	resourceRequirements := pod.GetPodResourceRequirements()
+	cpuRequested := int64(0)
+	for _, value := range resourceRequirements.InitContainers {
+		limit := value.Limits[v1.ResourceCPU]
+		request := value.Requests[v1.ResourceCPU]
+		if limit.MilliValue() > request.MilliValue() {
+			cpuRequested = cpuRequested + limit.MilliValue()
+		} else {
+			cpuRequested = cpuRequested + request.MilliValue()
+		}
+	}
+	for _, value := range resourceRequirements.Containers {
+		limit := value.Limits[v1.ResourceCPU]
+		request := value.Requests[v1.ResourceCPU]
+		if limit.MilliValue() > request.MilliValue() {
+			cpuRequested = cpuRequested + limit.MilliValue()
+		} else {
+			cpuRequested = cpuRequested + request.MilliValue()
+		}
+	}
+	log.Debug("pod %s : OriginPodMilliCPU %d", pod.GetName(), cpuRequested)
+	return cpuRequested, nil
 }
 
 // getPodMilliCPU returns mCPUs requested by podID.
@@ -586,6 +643,9 @@ func (p *podpools) setConfig(ppoptions *PodpoolsOptions) error {
 	nonReservedCpuCount := freeCpus.Size()
 	userPoolDefs := 0
 	for _, poolDef := range ppoptions.PoolDefs {
+		if poolDef.FillOrder == FillMinCPU && poolDef.MaxPods != 0 {
+			return podpoolsError("Bad configuration, MaxPods must not be defined when using MinCPU fill order.")
+		}
 		if err := p.applyPoolDef(&pools, poolDef, &freeCpus, nonReservedCpuCount); err != nil {
 			return err
 		}
@@ -609,7 +669,7 @@ func (p *podpools) setConfig(ppoptions *PodpoolsOptions) error {
 	for index, pool := range pools {
 		pool.Mems = p.closestMems(pool.CPUs)
 		pool.PodIDs = make(map[string][]string)
-		log.Info("- pool %d: %s, poolCPUThreshold %f", index, pool, pool.CPUThreshold)
+		log.Info("- pool %d: %s, poolCPUThreshold %f, availableMilliCPUs %d", index, pool, pool.CPUThreshold, p.availableMilliCPUs(pool))
 	}
 	// No errors in pool creation, take new configuration into use.
 	log.Debug("new %s configuration:\n%s", PolicyName, utils.DumpJSON(ppoptions))
@@ -724,6 +784,23 @@ func (p *podpools) availableMilliCPUs(pool *Pool) int64 {
 	cpuRequested := int64(0)
 	for podID := range pool.PodIDs {
 		cpuRequested += p.getPodMilliCPU(podID)
+	}
+	return int64(cpuAvail) - cpuRequested
+}
+
+// originAvailableMilliCPUs calculates mCPUs available in a pool by using the original resource
+// requirments of pods from cri-resmgr-webhook.
+func (p *podpools) originAvailableMilliCPUs(pool *Pool) int64 {
+	cpuAvail := float64(pool.CPUs.Size()*1000) * pool.CPUThreshold
+	cpuRequested := int64(0)
+	for podID := range pool.PodIDs {
+		pod, isFind := p.cch.LookupPod(podID)
+		if isFind {
+			originPodMilliCPU, err := p.getOriginPodMilliCPU(pod)
+			if err == nil {
+				cpuRequested += originPodMilliCPU
+			}
+		}
 	}
 	return int64(cpuAvail) - cpuRequested
 }
