@@ -21,7 +21,6 @@ import (
 	"strings"
 
 	corev1 "k8s.io/api/core/v1"
-	v1 "k8s.io/api/core/v1"
 	resapi "k8s.io/apimachinery/pkg/api/resource"
 	"k8s.io/kubernetes/pkg/kubelet/cm/cpuset"
 
@@ -206,6 +205,7 @@ func (p *podpools) AllocateResources(c cache.Container) error {
 		return podpoolsError("cannot find pod of container %s from the cache", c.PrettyName())
 	}
 	if pool := p.allocatePool(pod); pool != nil {
+		log.Debug("allocating container %s... %s", c.PrettyName(), pool.PrettyName())
 		p.assignContainer(c, pool)
 		p.trackPodCPU(pod, pool)
 		if log.DebugEnabled() {
@@ -296,11 +296,17 @@ func (p *podpools) allocatePool(pod cache.Pod) *Pool {
 		// FillMinCPU needs to work with cri-resmgr-webhook. cri-resmgr-webhook
 		// gives original pod spec resource requirements so that FillMinCPU can
 		// use pods' CPU requirements to choose the proper pool.
+		log.Info("### FillMinCPU")
 		annotatedPodMilliCPU, err := p.getOriginPodMilliCPU(pod)
+		log.Info("### pod %s annotatedPodMilliCPU %d", pod.GetName(), annotatedPodMilliCPU)
 		if err == nil {
+			// pools = filterPools(p.pools,
+			// 	func(pl *Pool) bool {
+			// 		return poolDef.Name == pl.Def.Name && p.originAvailableMilliCPUs(pl) >= annotatedPodMilliCPU
+			// 	}) //no need to count whether it's enough...只要选择出来 fps的判断会让他停下来
 			pools = filterPools(p.pools,
 				func(pl *Pool) bool {
-					return poolDef.Name == pl.Def.Name && p.originAvailableMilliCPUs(pl) >= annotatedPodMilliCPU
+					return poolDef.Name == pl.Def.Name
 				})
 		}
 	default:
@@ -438,34 +444,18 @@ func (p *podpools) validatePodCPU(pod cache.Pod, pool *Pool) {
 
 // getOriginPodMilliCPU get original pod spec resource requirements from webhook.
 func (p *podpools) getOriginPodMilliCPU(pod cache.Pod) (int64, error) {
-	// Judge whether the pods has been annotated by webhook.
-	_, ok := pod.GetAnnotation(cache.KeyResourceAnnotation)
+	podRequest, ok := pod.GetAnnotation("cri-resource-manager.intel.com/MilliCPURequest")
 	if !ok {
-		log.Error("The cri-resmgr-webhook doesn't be enabled.")
-		return 0, podpoolsError("The cri-resmgr-webhook doesn't be enabled.")
+		log.Error("Pod donesn't be annotated")
+		// return 0, podpoolsError("The cri-resmgr-webhook doesn't be enabled.")
+		return 0, nil
 	}
-	resourceRequirements := pod.GetPodResourceRequirements()
-	cpuRequested := int64(0)
-	for _, value := range resourceRequirements.InitContainers {
-		limit := value.Limits[v1.ResourceCPU]
-		request := value.Requests[v1.ResourceCPU]
-		if limit.MilliValue() > request.MilliValue() {
-			cpuRequested = cpuRequested + limit.MilliValue()
-		} else {
-			cpuRequested = cpuRequested + request.MilliValue()
-		}
+	cpuRequested, err := strconv.Atoi(podRequest)
+	if err != nil {
+		log.Error("CPU requested isn't correct.")
+		return 0, nil
 	}
-	for _, value := range resourceRequirements.Containers {
-		limit := value.Limits[v1.ResourceCPU]
-		request := value.Requests[v1.ResourceCPU]
-		if limit.MilliValue() > request.MilliValue() {
-			cpuRequested = cpuRequested + limit.MilliValue()
-		} else {
-			cpuRequested = cpuRequested + request.MilliValue()
-		}
-	}
-	log.Info("vicky-----pod %s ---getOriginPodMilliCPU %d", pod.GetName(), cpuRequested)
-	return cpuRequested, nil
+	return int64(cpuRequested), nil
 }
 
 // getPodMilliCPU returns mCPUs requested by podID.
@@ -791,7 +781,6 @@ func (p *podpools) availableMilliCPUs(pool *Pool) int64 {
 	for podID := range pool.PodIDs {
 		cpuRequested += p.getPodMilliCPU(podID)
 	}
-	// log.Info("vicky-pool %s cpuAvail float %f, cpuAvail int64 %d, cpuRequested %d", pool.PrettyName(), cpuAvail, int64(cpuAvail), cpuRequested)
 	return int64(cpuAvail) - cpuRequested
 }
 
@@ -809,7 +798,7 @@ func (p *podpools) originAvailableMilliCPUs(pool *Pool) int64 {
 			}
 		}
 	}
-	log.Info("vicky-pool %s cpuAvail float %f, cpuAvail int64 %d, cpuRequested %d", pool.PrettyName(), cpuAvail, int64(cpuAvail), cpuRequested)
+	log.Info("### pool %s cpuAvail float %f, cpuAvail int64 %d, cpuRequested %d", pool.PrettyName(), cpuAvail, int64(cpuAvail), cpuRequested)
 	return int64(cpuAvail) - cpuRequested
 }
 

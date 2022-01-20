@@ -283,12 +283,12 @@ func (sys *system) Discover(flags DiscoveryFlag) error {
 		}
 	}
 
-	if (sys.flags & DiscoverSst) != 0 {
-		if err := sys.discoverSst(); err != nil {
-			// Just consider SST unsupported if our detection fails for some reason
-			sys.Warn("%v", err)
-		}
-	}
+	// if (sys.flags & DiscoverSst) != 0 {
+	// 	if err := sys.discoverSst(); err != nil {
+	// 		// Just consider SST unsupported if our detection fails for some reason
+	// 		sys.Warn("%v", err)
+	// 	}
+	// }
 
 	if (sys.flags & DiscoverMemTopology) != 0 {
 		if err := sys.discoverNodes(); err != nil {
@@ -773,9 +773,9 @@ func (sys *system) discoverNodes() error {
 	}
 	cpuNodes := cpuNodesBuilder.Result()
 
-	sys.Logger.Info("NUMA nodes with CPUs: %s", cpuNodes.String())
-	sys.Logger.Info("NUMA nodes with (any) memory: %s", memoryNodes.String())
-	sys.Logger.Info("NUMA nodes with normal memory: %s", normalMemNodes.String())
+	sys.Logger.Debug("NUMA nodes with CPUs: %s", cpuNodes.String())
+	sys.Logger.Debug("NUMA nodes with (any) memory: %s", memoryNodes.String())
+	sys.Logger.Debug("NUMA nodes with normal memory: %s", normalMemNodes.String())
 
 	dramNodes := memoryNodes.Intersection(cpuNodes)
 	pmemOrHbmNodes := memoryNodes.Difference(dramNodes)
@@ -816,14 +816,14 @@ func (sys *system) discoverNodes() error {
 				return fmt.Errorf("not able to determine system special memory types")
 			}
 			if mem.MemTotal < dramAvg {
-				sys.Logger.Info("node %d has HBM memory", node.id)
+				sys.Logger.Debug("node %d has HBM memory", node.id)
 				node.memoryType = MemoryTypeHBM
 			} else {
-				sys.Logger.Info("node %d has PMEM memory", node.id)
+				sys.Logger.Debug("node %d has PMEM memory", node.id)
 				node.memoryType = MemoryTypePMEM
 			}
 		} else if _, ok := dramNodeIds[node.id]; ok {
-			sys.Logger.Info("node %d has DRAM memory", node.id)
+			sys.Logger.Debug("node %d has DRAM memory", node.id)
 			node.memoryType = MemoryTypeDRAM
 		} else {
 			return fmt.Errorf("Unknown memory type for node %v (pmem nodes: %s, dram nodes: %s)", node, pmemOrHbmNodes, dramNodes)
